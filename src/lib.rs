@@ -13,6 +13,7 @@ pub mod jwk;
 
 use std::{
     borrow::Cow,
+    convert::{TryFrom, TryInto},
     fmt,
     io::Write,
     string::FromUtf8Error,
@@ -39,6 +40,15 @@ pub struct Header {
 
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+impl TryFrom<&str> for Header {
+    type Error = serde_json::Error;
+    fn try_from(header: &str) -> std::result::Result<Self, serde_json::Error> {
+        let mut header = header.as_bytes();
+        let header_r = base64::read::DecoderReader::new(&mut header, url_safe_trailing_bits());
+        serde_json::from_reader(header_r)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -88,6 +98,18 @@ pub struct Claims<ExtraClaims> {
     pub extra: ExtraClaims,
 }
 
+impl<ExtraClaims> TryFrom<&str> for Claims<ExtraClaims>
+where
+    ExtraClaims: DeserializeOwned,
+{
+    type Error = serde_json::Error;
+    fn try_from(payload: &str) -> std::result::Result<Self, serde_json::Error> {
+        let mut payload = payload.as_bytes();
+        let payload_r = base64::read::DecoderReader::new(&mut payload, url_safe_trailing_bits());
+        serde_json::from_reader(payload_r)
+    }
+}
+
 /// JWT header and claims.
 ///
 /// # `ExtraClaims`
@@ -99,6 +121,29 @@ pub struct Claims<ExtraClaims> {
 pub struct HeaderAndClaims<ExtraClaims> {
     header: Header,
     claims: Claims<ExtraClaims>,
+}
+
+impl<ExtraClaims> TryFrom<&str> for HeaderAndClaims<ExtraClaims>
+where
+    ExtraClaims: DeserializeOwned,
+{
+    type Error = Error;
+
+    fn try_from(token: &str) -> Result<Self> {
+        let mut parts = token.split('.');
+
+        let header = parts.next().ok_or(Error::InvalidToken)?;
+        let payload = parts.next().ok_or(Error::InvalidToken)?;
+
+        let _ = parts.next().ok_or(Error::InvalidToken)?;
+        if parts.next().is_some() {
+            return Err(Error::InvalidToken);
+        }
+        Ok(HeaderAndClaims {
+            header: header.try_into()?,
+            claims: payload.try_into()?,
+        })
+    }
 }
 
 impl HeaderAndClaims<Map<String, Value>> {
@@ -308,32 +353,19 @@ pub fn verify_only<ExtraClaims: DeserializeOwned>(
     token: &str,
     k: &dyn VerificationKey,
 ) -> Result<HeaderAndClaims<ExtraClaims>> {
-    let mut parts = token.split('.');
-
-    let mut header = parts.next().ok_or(Error::InvalidToken)?.as_bytes();
-    let mut payload = parts.next().ok_or(Error::InvalidToken)?.as_bytes();
-    let header_and_payload_len = header.len() + payload.len() + 1;
-    let sig = parts.next().ok_or(Error::InvalidToken)?;
-    if parts.next().is_some() {
-        return Err(Error::InvalidToken);
-    }
-
-    let header_r = base64::read::DecoderReader::new(&mut header, url_safe_trailing_bits());
-    let header: Header = serde_json::from_reader(header_r)?;
-
-    let sig = base64::decode_config(sig, url_safe_trailing_bits())?;
+    let jwt: HeaderAndClaims<ExtraClaims> = token.try_into()?;
+    let parts = token.rsplit_once('.').unwrap();
+    let header_and_payload_len = parts.0.len();
+    let sig = base64::decode_config(parts.1, url_safe_trailing_bits())?;
 
     // Verify the signature.
     k.verify(
         token[..header_and_payload_len].as_bytes(),
         &sig,
-        &header.alg,
+        &jwt.header.alg,
     )?;
 
-    let payload_r = base64::read::DecoderReader::new(&mut payload, url_safe_trailing_bits());
-    let claims: Claims<ExtraClaims> = serde_json::from_reader(payload_r)?;
-
-    Ok(HeaderAndClaims { header, claims })
+    Ok(jwt)
 }
 
 /// Decode token.
@@ -342,22 +374,7 @@ pub fn verify_only<ExtraClaims: DeserializeOwned>(
 pub fn decode_without_verify<ExtraClaims: DeserializeOwned>(
     token: &str,
 ) -> Result<HeaderAndClaims<ExtraClaims>> {
-    let mut parts = token.split('.');
-
-    let mut header = parts.next().ok_or(Error::InvalidToken)?.as_bytes();
-    let mut payload = parts.next().ok_or(Error::InvalidToken)?.as_bytes();
-    let _sig = parts.next().ok_or(Error::InvalidToken)?;
-    if parts.next().is_some() {
-        return Err(Error::InvalidToken);
-    }
-
-    let header_r = base64::read::DecoderReader::new(&mut header, url_safe_trailing_bits());
-    let header: Header = serde_json::from_reader(header_r)?;
-
-    let payload_r = base64::read::DecoderReader::new(&mut payload, url_safe_trailing_bits());
-    let claims: Claims<ExtraClaims> = serde_json::from_reader(payload_r)?;
-
-    Ok(HeaderAndClaims { header, claims })
+    token.try_into()
 }
 
 pub trait SigningKey {
